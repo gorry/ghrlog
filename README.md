@@ -8,6 +8,8 @@
 
 Google Home（Nest Hub 等）の「おはよう」「おやすみ」ルーティン実行時刻を自動記録・可視化する Cloudflare Worker です。
 
+<img width="1580" height="1650" alt="Image" src="https://github.com/user-attachments/assets/cda057ff-6a4f-44b1-950f-065e9ecfbc5b" />
+
 ---
 
 ## 概要と開発の背景
