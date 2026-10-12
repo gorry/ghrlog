@@ -1,0 +1,7 @@
+node_modules/
+.wrangler/
+.dev.vars
+log/
+src/profile.js
+wrangler.toml
+CLAUDE.md

@@ -1,0 +1,18 @@
+{
+  "name": "ghrlog",
+  "version": "2026.1012.1",
+  "description": "Google Home Sleep Routine Logger",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pretest": "node scripts/profile.mjs",
+    "test": "node test/smoke.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

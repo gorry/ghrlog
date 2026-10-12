@@ -1,0 +1,8 @@
+CREATE TABLE IF NOT EXISTS logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  at TEXT NOT NULL,
+  request_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_logs_at ON logs (at);

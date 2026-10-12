@@ -1,0 +1,25 @@
+# wrangler.toml のひな型。wrangler.toml にコピーして値を記入する（wrangler.toml は git 管理外）。
+name = "routine-logger"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# Profile.ini から src/profile.js を生成する（deploy・dev のたびに実行される）
+[build]
+command = "node scripts/profile.mjs"
+
+[[d1_databases]]
+# binding 名は DB のまま（コードは env.DB を使う）
+binding = "DB"
+database_name = "routine-logger"
+database_id = "ここに wrangler d1 create の出力の database_id を入れる"
+
+[vars]
+# Google Home Developer Console のプロジェクトID（リダイレクトURI検証用）
+GOOGLE_PROJECT_ID = "ここにプロジェクトID"
+
+# 以下はシークレットとして登録する（wrangler secret put <名前>、または wrangler secret bulk .dev.vars）
+#   CLIENT_ID      Developer Console に入力する OAuth クライアントID
+#   CLIENT_SECRET  同 クライアントシークレット
+#   ACCESS_TOKEN   Google に渡すアクセストークン（長いランダム文字列）
+#   REFRESH_TOKEN  同 リフレッシュトークン
+#   VIEW_TOKEN     /logs 閲覧用トークン
