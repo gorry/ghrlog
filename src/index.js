@@ -234,9 +234,12 @@ async function logs(req, url, env) {
 
 async function logsPage(url, token, env) {
   const month = url.searchParams.get("month") ?? "";
-  const view = /^\d{4}-(0[1-9]|1[0-2])$/.test(month)
-    ? await monthView(month, env)
-    : await recentView(Math.min(Number(url.searchParams.get("days")) || 30, 365), env);
+  const view =
+    url.searchParams.get("view") === "stats"
+      ? await statsView(env)
+      : /^\d{4}-(0[1-9]|1[0-2])$/.test(month)
+        ? await monthView(month, env)
+        : await recentView(Math.min(Number(url.searchParams.get("days")) || 30, 365), env);
 
   return new Response(renderPage({ ...view, token }), {
     headers: {
@@ -307,6 +310,39 @@ async function monthView(month, env) {
 
 // 一晩の区切り（日本時間）。朝から昼過ぎまで眠る日（7:00〜13:00 など）も一晩に収まるよう 18 時にする
 const NIGHT_START_H = 18;
+
+// 全期間の夜を、月別・曜日別にまとめる
+async function statsView(env) {
+  const { results } = await env.DB.prepare("SELECT event, at FROM logs ORDER BY at").all();
+  const nights = toNights(results).reverse();
+  const label = (s) => `${Number(s.slice(0, 4))}年${Number(s.slice(5))}月`;
+
+  const months = [...new Set(nights.map((n) => n.date.slice(0, 7)))].map((m) => ({
+    label: label(m),
+    href: { month: m },
+    nights: nights.filter((n) => n.date.startsWith(m)),
+  }));
+  // 曜日はその夜の日付の曜日（金曜の夜 = 金曜 23 時に寝て土曜の朝に起きた夜）
+  const weekday = (n) => new Date(`${n.date}T00:00:00Z`).getUTCDay();
+  const weekdays = [1, 2, 3, 4, 5, 6, 0].map((d) => ({
+    label: `${"日月火水木金土"[d]}曜の夜`,
+    nights: nights.filter((n) => weekday(n) === d),
+  }));
+
+  const counted = summarize(nights).count;
+  const since = nights.length ? `${label(nights[0].date.slice(0, 7))}〜 ・ ` : "";
+  return {
+    view: "stats",
+    nights: [],
+    subtitle: `全期間 ・ ${since}平均に含めた夜 ${counted}`,
+    statsTitle: "全期間の平均",
+    statsNights: nights,
+    groups: [
+      { title: "月別", rows: months },
+      { title: "曜日別", rows: weekdays },
+    ],
+  };
+}
 
 function nightDate(ms) {
   return new Date(ms + JST - NIGHT_START_H * 3600e3).toISOString().slice(0, 10);
@@ -407,12 +443,19 @@ function average(list) {
   return list.length ? list.reduce((a, b) => a + b, 0) / list.length : null;
 }
 
-function renderPage({ nights, days, month, subtitle, statsTitle, statsNights, nav, token }) {
-  // 平均（就寝・起床は横軸上の位置で平均し、0時をまたいでも崩れないようにする）
-  const counted = statsNights.filter((n) => n.total >= MIN_SLEEP_MIN);
-  const avgSleep = average(counted.map((n) => axisMin(n, n.segments[0].sleep)));
-  const avgWake = average(counted.map((n) => axisMin(n, n.segments.at(-1).wake)));
-  const avgDur = average(counted.map((n) => n.total));
+// 平均（就寝・起床は横軸上の位置で平均し、0時をまたいでも崩れないようにする）
+function summarize(nights) {
+  const counted = nights.filter((n) => n.total >= MIN_SLEEP_MIN);
+  return {
+    count: counted.length,
+    avgSleep: average(counted.map((n) => axisMin(n, n.segments[0].sleep))),
+    avgWake: average(counted.map((n) => axisMin(n, n.segments.at(-1).wake))),
+    avgDur: average(counted.map((n) => n.total)),
+  };
+}
+
+function renderPage({ view, nights, days, month, subtitle, statsTitle, statsNights, nav, groups, token }) {
+  const { avgSleep, avgWake, avgDur } = summarize(statsNights);
   const stat = (label, value) =>
     `<div class="stat"><div class="stat-label">${label}</div><div class="stat-value">${value ?? "—"}</div></div>`;
 
@@ -444,12 +487,56 @@ function renderPage({ nights, days, month, subtitle, statsTitle, statsNights, na
     .join("\n");
 
   const q = (params) => `?${new URLSearchParams({ token, ...params })}`;
+
+  // 統計: 月別・曜日別の平均。バーは平均のおやすみ〜おはよう
+  const groupRows = (rows) =>
+    rows
+      .map(({ label, href, nights }) => {
+        const g = summarize(nights);
+        const name = href ? `<a href="${q(href)}">${label}</a>` : label;
+        const bar =
+          g.count && g.avgWake > g.avgSleep
+            ? `<div class="bar" style="left:${pct(g.avgSleep)}%;width:${(pct(g.avgWake) - pct(g.avgSleep)).toFixed(2)}%" title="${label} 平均 ${hmFromAxis(g.avgSleep)} → ${hmFromAxis(g.avgWake)}"></div>`
+            : "";
+        return `<div class="row group">
+  <div class="c-date">${name}</div>
+  <div class="c-count">${g.count}</div>
+  <div class="c-time">${g.count ? hmFromAxis(g.avgSleep) : "—"}</div>
+  <div class="c-time">${g.count ? hmFromAxis(g.avgWake) : "—"}</div>
+  <div class="c-dur">${g.count ? duration(g.avgDur) : "—"}</div>
+  <div class="c-bar"><div class="track">${bar}</div></div>
+</div>`;
+      })
+      .join("\n");
+  const tables = (groups ?? [])
+    .map(
+      (g) => `<h2>${g.title}</h2>
+<section class="list">
+<div class="row group head">
+  <div></div><div class="c-count">夜数</div><div class="c-time">おやすみ</div><div class="c-time">おはよう</div><div class="c-dur">睡眠</div>
+  <div class="c-bar"><div class="ticks">${ticks}</div></div>
+</div>
+${groupRows(g.rows) || `<div class="empty">記録がありません</div>`}
+</section>`,
+    )
+    .join("\n");
+  const list = groups
+    ? tables
+    : `<section class="list">
+<div class="row head">
+  <div>日付</div><div class="c-time">おやすみ</div><div class="c-time">おはよう</div><div class="c-dur">睡眠</div>
+  <div class="c-bar"><div class="ticks">${ticks}</div></div>
+</div>
+${rows || `<div class="empty">記録がありません</div>`}
+</section>`;
+
   const range = [7, 30, 90]
     .map((d) => (d === days ? `<strong>${d}日</strong>` : `<a href="${q({ days: d })}">${d}日</a>`))
     .join(" ・ ");
   const thisMonth = nightDate(Date.now()).slice(0, 7);
   const monthLink =
     month === thisMonth ? "<strong>今月</strong>" : `<a href="${q({ month: thisMonth })}">今月</a>`;
+  const statsLink = view === "stats" ? "<strong>統計</strong>" : `<a href="${q({ view: "stats" })}">統計</a>`;
   const monthNav = nav
     ? `<nav class="months">
 <a href="${q({ month: nav.prev[0] })}">‹ ${nav.prev[1]}</a>
@@ -520,6 +607,9 @@ h2 { font-size: .85rem; font-weight: 600; color: var(--text-2); margin: 0 0 8px;
   font-variant-numeric: tabular-nums;
 }
 .row.head { border-top: 0; color: var(--text-2); font-size: .8rem; }
+.row.group { grid-template-columns: 6.5rem 2.5rem 3.5rem 3.5rem 6rem 1fr; }
+.list + h2 { margin-top: 24px; }
+.c-count { text-align: right; color: var(--text-2); }
 .c-time, .c-dur { text-align: right; }
 .c-dur { color: var(--text-2); }
 .track {
@@ -548,6 +638,9 @@ a { color: var(--series); }
   .stat { padding: 10px; }
   .stat-value { font-size: 1.2rem; }
   .row { grid-template-columns: 1fr 3.5rem 3.5rem 5.5rem; row-gap: 4px; }
+  .row.group { grid-template-columns: 2.5rem 1fr 1fr 5.5rem; }
+  .row.group .c-date { grid-column: 1 / -1; }
+  .row.group.head > div:first-child { display: none; }
   .c-bar { grid-column: 1 / -1; }
 }
 </style>
@@ -564,15 +657,9 @@ ${stat("おはよう", avgWake === null ? null : hmFromAxis(avgWake))}
 ${stat("睡眠時間", avgDur === null ? null : duration(avgDur))}
 </section>
 <p class="note">睡眠時間が${MIN_SLEEP_MIN}分未満の日は、平均に含めていません。</p>
-<section class="list">
-<div class="row head">
-  <div>日付</div><div class="c-time">おやすみ</div><div class="c-time">おはよう</div><div class="c-dur">睡眠</div>
-  <div class="c-bar"><div class="ticks">${ticks}</div></div>
-</div>
-${rows || `<div class="empty">記録がありません</div>`}
-</section>
+${list}
 <footer>
-<div>表示期間: ${range} ・ 月別: ${monthLink}</div>
+<div>表示期間: ${range} ・ 月別: ${monthLink} ・ ${statsLink}</div>
 <div>エクスポート: <a href="${q({ format: "csv" })}">CSV（Excel 用）</a> ・ <a href="${q({ format: "json", limit: "all" })}" download="logs.json">JSON</a> | インポート: <label class="restore">JSON<input type="file" id="restore" accept=".json,application/json" hidden></label></div>
 <div class="msg" id="restore-msg" role="status"></div>
 <div class="app"><a href="${esc(PROFILE.URL.Project)}">${esc(PROFILE.Title.Text)}</a> ${esc(PROFILE.Version.Text)} ・ ${esc(PROFILE.Copyright.Text)}</div>

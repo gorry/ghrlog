@@ -39,6 +39,8 @@ Google Home では就寝時や起床時に「おやすみ」「おはよう」�
 - **月別表示**:
   `?month=YYYY-MM` パラメータで指定月の全日程と月平均睡眠時間を表示。
   平均は、睡眠時間が10分未満の日（おはよう・おやすみの片方しか記録がない日を含む）を除いて計算します。誤操作による記録で平均がずれないようにするためです。
+- **統計**:
+  `?view=stats` で、全期間の平均と、月別・曜日別の平均（おやすみ・おはよう・睡眠時間、平均に含めた夜の数）を表示。曜日はその夜の日付の曜日です（金曜の夜 = 金曜に寝て土曜の朝に起きた夜）。
 - **データ連携（JSON / CSV）**:
   API やスプレッドシート連携用の JSON 出力、および Excel でそのまま開ける BOM 付き CSV エクスポートに対応。
 - **個人利用に特化したミニマル設計**:
@@ -181,6 +183,9 @@ https://<worker-domain>/logs?token=<VIEW_TOKEN>
 # 月別表示（YYYY-MM 形式）
 https://<worker-domain>/logs?token=<VIEW_TOKEN>&month=2026-10
 
+# 統計（全期間の月別・曜日別）
+https://<worker-domain>/logs?token=<VIEW_TOKEN>&view=stats
+
 # JSON 形式（API連携・自動化用）
 https://<worker-domain>/logs?token=<VIEW_TOKEN>&format=json
 
@@ -196,6 +201,7 @@ https://<worker-domain>/logs?token=<VIEW_TOKEN>&format=csv
 | `format` | `html` / `json` / `csv` | `html` (ブラウザ) / `json` (curl等) | 出力フォーマット |
 | `days` | 数値 | 30 | 一覧で表示する直近の日数（最大 365 日） |
 | `month` | `YYYY-MM` | - | 指定した月の全日一覧および月間平均を表示 |
+| `view` | `stats` | - | 全期間の月別・曜日別の統計を表示 |
 | `limit` | 数値 / `all` | 100 | JSON / CSV 取得時の最大件数。`all` で全件 |
 
 ### インポート（記録の置き換え）

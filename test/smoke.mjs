@@ -198,6 +198,18 @@ assert.match(await page("month=2026-09"), /9\/30\(水\)の夜 15:00 → 21:00（
 assert.match(await page("month=2026-10"), /<div class="c-date">10\/1\(木\)<\/div>\s*<div class="c-time">—<\/div>\s*<div class="c-time">—<\/div>/);
 rows.splice(-2);
 
+// 統計: 全期間の月別・曜日別（10/10 土曜の夜だけが平均に入り、10/11 はおやすみだけなので外れる）
+const stats = await page("view=stats");
+assert.match(stats, /全期間 ・ 2026年10月〜 ・ 平均に含めた夜 1/);
+assert.match(stats, /<strong>統計<\/strong>/);
+const groupRow = (label) =>
+  new RegExp(`${label}(</a>)?</div>\\s*<div class="c-count">(\\d+)</div>\\s*<div class="c-time">([^<]*)</div>\\s*<div class="c-time">([^<]*)</div>\\s*<div class="c-dur">([^<]*)</div>`);
+assert.deepEqual(stats.match(groupRow('<a href="\\?token=vt&amp;month=2026-10">2026年10月|<a href="\\?token=vt&month=2026-10">2026年10月')).slice(2), ["1", "23:41", "6:52", "7時間11分"]);
+assert.deepEqual(stats.match(groupRow("土曜の夜")).slice(2), ["1", "23:41", "6:52", "7時間11分"]);
+assert.deepEqual(stats.match(groupRow("日曜の夜")).slice(2), ["0", "—", "—", "—"]);
+assert.ok(stats.indexOf("月曜の夜") < stats.indexOf("日曜の夜"));
+assert.match(await page("days=30"), /<a href="\?token=vt&amp;view=stats">統計<\/a>|<a href="\?token=vt&view=stats">統計<\/a>/);
+
 // インポート: エクスポートと同じ形で受け取り、記録を置き換える
 const importLogs = (body, token = "vt") =>
   call("/logs/import", {
