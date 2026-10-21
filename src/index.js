@@ -12,6 +12,8 @@
 //   POST /fulfillment      SYNC / QUERY / EXECUTE / DISCONNECT
 //   GET  /logs             記録の閲覧（?token=VIEW_TOKEN または Bearer）
 //                          ブラウザでは一覧ページ、format=json / csv でデータ
+//   POST /logs/import      記録の置き換え（VIEW_TOKEN、本文は format=json と同じ形）
+//                          一覧ページの「インポート: JSON」から呼ぶ
 
 import PROFILE from "./profile.js";
 
@@ -39,6 +41,9 @@ export default {
       }
       if (url.pathname === "/logs" && req.method === "GET") {
         return await logs(req, url, env);
+      }
+      if (url.pathname === "/logs/import" && req.method === "POST") {
+        return await importLogs(req, url, env);
       }
       return new Response("Not found", { status: 404 });
     } catch (e) {
@@ -198,12 +203,14 @@ async function logs(req, url, env) {
     url.searchParams.get("format")?.toLowerCase() ?? (accept.includes("text/html") ? "html" : "json");
   if (format === "html") return await logsPage(url, t, env);
 
-  const limit = Math.min(Number(url.searchParams.get("limit")) || 100, 1000);
-  const { results } = await env.DB.prepare(
-    "SELECT event, at FROM logs ORDER BY id DESC LIMIT ?",
-  )
-    .bind(limit)
-    .all();
+  // limit=all は全件（一覧ページの JSON リンク。復元に使うので欠けないようにする）
+  const all = url.searchParams.get("limit") === "all";
+  const n = Math.floor(Number(url.searchParams.get("limit")));
+  const limit = n > 0 ? n : 100;
+  const { results } = await (all
+    ? env.DB.prepare("SELECT event, at FROM logs ORDER BY id DESC")
+    : env.DB.prepare("SELECT event, at FROM logs ORDER BY id DESC LIMIT ?").bind(limit)
+  ).all();
 
   const fmt = new Intl.DateTimeFormat("ja-JP", {
     timeZone: "Asia/Tokyo",
@@ -243,13 +250,14 @@ async function logsPage(url, token, env) {
 
 // 直近 days 日の夜を新しい順に並べる
 async function recentView(days, env) {
-  const since = new Date(Date.now() - (days + 1) * 86400e3).toISOString();
+  const since = Date.now() - (days + 1) * 86400e3;
+  // 最初の夜の区間が欠けないよう、その前の記録も読んで組にしてから外す
   const { results } = await env.DB.prepare(
     "SELECT event, at FROM logs WHERE at >= ? ORDER BY at",
   )
-    .bind(since)
+    .bind(new Date(since - MAX_SEGMENT_MIN * 60000).toISOString())
     .all();
-  const nights = toNights(results);
+  const nights = toNights(results).filter((n) => n.date >= nightDate(since));
   return {
     days,
     nights,
@@ -268,9 +276,10 @@ async function monthView(month, env) {
   const { results } = await env.DB.prepare(
     "SELECT event, at FROM logs WHERE at >= ? AND at < ? ORDER BY at",
   )
+    // 月の境目をまたぐ区間が欠けないよう、前後に区間の最長の分だけ広げて読む
     .bind(
-      new Date(`${month}-01T12:00:00+09:00`).toISOString(),
-      new Date(`${next}-01T12:00:00+09:00`).toISOString(),
+      new Date(Date.parse(`${month}-01T${NIGHT_START_H}:00:00+09:00`) - MAX_SEGMENT_MIN * 60000).toISOString(),
+      new Date(Date.parse(`${next}-01T${NIGHT_START_H}:00:00+09:00`) + MAX_SEGMENT_MIN * 60000).toISOString(),
     )
     .all();
 
@@ -281,7 +290,7 @@ async function monthView(month, env) {
   for (let d = 1; d <= lastDay; d++) {
     const date = `${month}-${String(d).padStart(2, "0")}`;
     if (date > tonight) break;
-    nights.push(byDate.get(date) ?? { date, sleep: null, wake: null });
+    nights.push(byDate.get(date) ?? emptyNight(date));
   }
   const recorded = nights.filter((n) => n.sleep || n.wake).length;
   const label = (s) => `${Number(s.slice(0, 4))}年${Number(s.slice(5))}月`;
@@ -296,33 +305,74 @@ async function monthView(month, env) {
   };
 }
 
+// 一晩の区切り（日本時間）。朝から昼過ぎまで眠る日（7:00〜13:00 など）も一晩に収まるよう 18 時にする
+const NIGHT_START_H = 18;
+
 function nightDate(ms) {
-  return new Date(ms + JST - 12 * 3600e3).toISOString().slice(0, 10);
+  return new Date(ms + JST - NIGHT_START_H * 3600e3).toISOString().slice(0, 10);
 }
 
-// 日本時間の正午で日付を区切り、おやすみと翌朝のおはようを「一晩」にまとめる。
-// 日付はその夜の日付（10/11 23:41 就寝 → 10/12 6:52 起床 は 10/11 の夜）。
+// segments: おやすみと次のおはようの組（眠っていた区間）
+// lone: 組にならなかったおやすみ・おはよう（グラフでは点で示す）
+// sleep / wake: 一覧の「おやすみ」「おはよう」の列。最初の区間の開始と最後の区間の終了
+function emptyNight(date) {
+  return { date, segments: [], lone: [], sleep: null, wake: null, total: 0 };
+}
+
+// おやすみと次のおはようの間がこれより長いときは、記録し忘れとみなして組にしない
+const MAX_SEGMENT_MIN = 16 * 60;
+
+// おやすみと次のおはようを組にしてから、組を眠り始めた時刻の夜に入れる。
+// 夜は日本時間の 18 時で区切り、日付はその夜の日付
+// （10/11 23:41 就寝 → 10/12 6:52 起床 は 10/11 の夜。15:00〜21:00 のように区切りをまたいでも、眠り始めた夜に入る）。
+// 一晩に何度か眠ったときは区間ごとに残し、睡眠時間はその合計にする。
 function toNights(rows) {
   const nights = new Map();
+  const night = (ms) => {
+    const date = nightDate(ms);
+    if (!nights.has(date)) nights.set(date, emptyNight(date));
+    return nights.get(date);
+  };
+  const lone = (event, ms) => night(ms).lone.push({ event, ms });
+  let pending = null; // まだおはようが来ていないおやすみ
+  let prev = null;
   for (const r of [...rows].sort((a, b) => a.at.localeCompare(b.at))) {
     const ms = Date.parse(r.at);
-    const date = nightDate(ms);
-    if (!nights.has(date)) nights.set(date, { date, sleep: null, wake: null });
-    const n = nights.get(date);
     if (r.event === "おやすみ") {
       // 寝直したときは最後のおやすみを採り、その後のおはようを待つ
-      n.sleep = ms;
-      n.wake = null;
-    } else if (r.event === "おはよう" && n.wake === null) {
-      n.wake = ms;
+      pending = ms;
+    } else if (r.event === "おはよう") {
+      if (pending !== null && ms - pending <= MAX_SEGMENT_MIN * 60000) {
+        night(pending).segments.push({ sleep: pending, wake: ms });
+      } else if (pending !== null) {
+        lone("おやすみ", pending);
+        lone("おはよう", ms);
+      } else if (prev !== "おはよう") {
+        // おはようが続いたときは最初のものを採り、残りは重複とみなして捨てる
+        lone("おはよう", ms);
+      }
+      pending = null;
     }
+    prev = r.event;
+  }
+  if (pending !== null) lone("おやすみ", pending);
+  for (const n of nights.values()) {
+    n.lone.sort((a, b) => a.ms - b.ms);
+    const first = n.segments[0];
+    const last = n.segments.at(-1);
+    n.sleep = first?.sleep ?? n.lone.find((x) => x.event === "おやすみ")?.ms ?? null;
+    n.wake = last?.wake ?? n.lone.find((x) => x.event === "おはよう")?.ms ?? null;
+    n.total = n.segments.reduce((a, x) => a + (x.wake - x.sleep) / 60000, 0);
   }
   return [...nights.values()].reverse();
 }
 
-// グラフの横軸: その夜の 18:00 から翌 14:00 まで（20時間）
-const AXIS_START_H = 18;
-const AXIS_MIN = 20 * 60;
+// グラフの横軸: その夜の 18:00 から翌 18:00 まで（24時間。一晩の区切りと同じ）
+const AXIS_START_H = NIGHT_START_H;
+const AXIS_MIN = 24 * 60;
+
+// 睡眠時間がこれより短い夜（片方しか記録がない夜を含む）は、誤操作とみなして平均から外す
+const MIN_SLEEP_MIN = 10;
 
 function axisMin(night, ms) {
   const start = Date.parse(`${night.date}T${AXIS_START_H}:00:00+09:00`);
@@ -358,38 +408,36 @@ function average(list) {
 }
 
 function renderPage({ nights, days, month, subtitle, statsTitle, statsNights, nav, token }) {
-  const sleepMin = (n) => (n.sleep && n.wake && n.wake > n.sleep ? (n.wake - n.sleep) / 60000 : null);
-
   // 平均（就寝・起床は横軸上の位置で平均し、0時をまたいでも崩れないようにする）
-  const avgSleep = average(statsNights.filter((n) => n.sleep).map((n) => axisMin(n, n.sleep)));
-  const avgWake = average(statsNights.filter((n) => n.wake).map((n) => axisMin(n, n.wake)));
-  const avgDur = average(statsNights.map(sleepMin).filter((m) => m !== null));
+  const counted = statsNights.filter((n) => n.total >= MIN_SLEEP_MIN);
+  const avgSleep = average(counted.map((n) => axisMin(n, n.segments[0].sleep)));
+  const avgWake = average(counted.map((n) => axisMin(n, n.segments.at(-1).wake)));
+  const avgDur = average(counted.map((n) => n.total));
   const stat = (label, value) =>
     `<div class="stat"><div class="stat-label">${label}</div><div class="stat-value">${value ?? "—"}</div></div>`;
 
-  const ticks = [18, 21, 0, 3, 6, 9, 12]
-    .map((h, i) => `<span style="left:${i * 15}%">${h}時</span>`)
+  const ticks = [18, 21, 0, 3, 6, 9, 12, 15, 18]
+    .map((h, i) => `<span style="left:${i * 12.5}%">${h}時</span>`)
     .join("");
 
   const rows = nights
     .map((n) => {
-      const dur = sleepMin(n);
-      let mark = "";
-      if (dur !== null) {
-        const l = pct(axisMin(n, n.sleep));
-        const r = pct(axisMin(n, n.wake));
-        const tip = `${dateLabel(n.date)}の夜 ${hm(n.sleep)} → ${hm(n.wake)}（${duration(dur)}）`;
-        mark = `<div class="bar" style="left:${l}%;width:${(r - l).toFixed(2)}%" title="${tip}"></div>`;
-      } else if (n.sleep || n.wake) {
-        const ms = n.sleep ?? n.wake;
-        const tip = `${dateLabel(n.date)}の夜 ${n.sleep ? "おやすみ" : "おはよう"} ${hm(ms)}`;
-        mark = `<div class="dot" style="left:${pct(axisMin(n, ms))}%" title="${tip}"></div>`;
-      }
+      const bars = n.segments.map(({ sleep, wake }) => {
+        const l = pct(axisMin(n, sleep));
+        const r = pct(axisMin(n, wake));
+        const tip = `${dateLabel(n.date)}の夜 ${hm(sleep)} → ${hm(wake)}（${duration((wake - sleep) / 60000)}）`;
+        return `<div class="bar" style="left:${l}%;width:${(r - l).toFixed(2)}%" title="${tip}"></div>`;
+      });
+      const dots = n.lone.map(({ event, ms }) => {
+        const tip = `${dateLabel(n.date)}の夜 ${event} ${hm(ms)}`;
+        return `<div class="dot" style="left:${pct(axisMin(n, ms))}%" title="${tip}"></div>`;
+      });
+      const mark = [...bars, ...dots].join("");
       return `<div class="row">
   <div class="c-date">${dateLabel(n.date)}</div>
   <div class="c-time">${n.sleep ? hm(n.sleep) : "—"}</div>
   <div class="c-time">${n.wake ? hm(n.wake) : "—"}</div>
-  <div class="c-dur">${dur !== null ? duration(dur) : "—"}</div>
+  <div class="c-dur">${n.segments.length ? duration(n.total) : "—"}</div>
   <div class="c-bar"><div class="track">${mark}</div></div>
 </div>`;
     })
@@ -456,7 +504,8 @@ h1 { font-size: 1.4rem; margin: 0; }
 .months { display: flex; justify-content: space-between; margin: -8px 0 20px; }
 .months a { text-decoration: none; }
 h2 { font-size: .85rem; font-weight: 600; color: var(--text-2); margin: 0 0 8px; }
-.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 24px; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 8px; }
+.note { color: var(--text-2); font-size: .8rem; margin: 0 0 24px; }
 .stat { min-width: 0; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
 .stat-label { color: var(--text-2); font-size: .8rem; }
 .stat-value { font-size: 1.5rem; font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -476,7 +525,7 @@ h2 { font-size: .85rem; font-weight: 600; color: var(--text-2); margin: 0 0 8px;
 .track {
   position: relative;
   height: 14px;
-  background-image: repeating-linear-gradient(to right, var(--grid) 0 1px, transparent 1px 15%);
+  background-image: repeating-linear-gradient(to right, var(--grid) 0 1px, transparent 1px 12.5%);
 }
 .bar { position: absolute; top: 2px; height: 10px; min-width: 4px; border-radius: 4px; background: var(--series); }
 .dot {
@@ -486,9 +535,13 @@ h2 { font-size: .85rem; font-weight: 600; color: var(--text-2); margin: 0 0 8px;
 .ticks { position: relative; height: 1.2em; }
 .ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
 .ticks span:first-child { transform: none; }
+.ticks span:last-child { transform: translateX(-100%); }
 .empty { color: var(--text-2); padding: 24px 0; text-align: center; }
 footer { margin-top: 20px; color: var(--text-2); font-size: .85rem; display: flex; flex-wrap: wrap; gap: 8px 24px; }
 footer .app { flex-basis: 100%; color: var(--muted); font-size: .8rem; }
+.restore { color: var(--series); text-decoration: underline; cursor: pointer; }
+.msg { flex-basis: 100%; color: var(--text); }
+.msg:empty { display: none; }
 a { color: var(--series); }
 @media (max-width: 560px) {
   .stats { gap: 8px; }
@@ -510,6 +563,7 @@ ${stat("おやすみ", avgSleep === null ? null : hmFromAxis(avgSleep))}
 ${stat("おはよう", avgWake === null ? null : hmFromAxis(avgWake))}
 ${stat("睡眠時間", avgDur === null ? null : duration(avgDur))}
 </section>
+<p class="note">睡眠時間が${MIN_SLEEP_MIN}分未満の日は、平均に含めていません。</p>
 <section class="list">
 <div class="row head">
   <div>日付</div><div class="c-time">おやすみ</div><div class="c-time">おはよう</div><div class="c-dur">睡眠</div>
@@ -519,13 +573,82 @@ ${rows || `<div class="empty">記録がありません</div>`}
 </section>
 <footer>
 <div>表示期間: ${range} ・ 月別: ${monthLink}</div>
-<div>データ: <a href="${q({ format: "csv" })}">CSV（Excel 用）</a> ・ <a href="${q({ format: "json" })}">JSON</a></div>
+<div>エクスポート: <a href="${q({ format: "csv" })}">CSV（Excel 用）</a> ・ <a href="${q({ format: "json", limit: "all" })}" download="logs.json">JSON</a> | インポート: <label class="restore">JSON<input type="file" id="restore" accept=".json,application/json" hidden></label></div>
+<div class="msg" id="restore-msg" role="status"></div>
 <div class="app"><a href="${esc(PROFILE.URL.Project)}">${esc(PROFILE.Title.Text)}</a> ${esc(PROFILE.Version.Text)} ・ ${esc(PROFILE.Copyright.Text)}</div>
 </footer>
 </main>
+<script>
+const TOKEN = ${JSON.stringify(token).replace(/</g, "\\u003c")};
+const input = document.getElementById("restore");
+const msg = document.getElementById("restore-msg");
+input.addEventListener("change", async () => {
+  const file = input.files[0];
+  input.value = "";
+  if (!file) return;
+  if (!confirm("いまの記録はすべて削除され、「" + file.name + "」の内容に置き換わります。よろしいですか？")) return;
+  msg.textContent = "復元しています…";
+  try {
+    const r = await fetch("/logs/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + TOKEN },
+      body: await file.text(),
+    });
+    const res = await r.json().catch(() => ({}));
+    if (r.ok) {
+      msg.textContent = res.imported + "件の記録を復元しました。";
+      setTimeout(() => location.reload(), 1500);
+      return;
+    }
+    msg.textContent =
+      res.error === "invalid_record"
+        ? (res.index + 1) + "件目の記録が正しくないため、復元できませんでした。記録は変更していません。ファイルの内容を確認してください。"
+        : res.error === "invalid_json" || res.error === "invalid_body"
+          ? "このファイルは復元に使えません。記録は変更していません。この画面の「エクスポート」の「JSON」で保存したファイルを選んでください。"
+          : r.status === 401
+            ? "復元する権限がありません。記録は変更していません。ページのアドレスを確認してください。"
+            : "復元できませんでした。記録は変更していません。時間をおいてもう一度お試しください。";
+  } catch {
+    msg.textContent = "復元できませんでした。記録は変更していません。通信状態を確認して、もう一度お試しください。";
+  }
+});
+</script>
 </body>
 </html>
 `;
+}
+
+// ---------- インポート ----------
+
+// format=json の出力と同じ形（[{ event, at, local }]）を受け取り、記録をすべて置き換える。
+// local は表示用なので読まない。1件でも不正なら何も変えない。
+async function importLogs(req, url, env) {
+  const t = url.searchParams.get("token") ?? bearer(req);
+  if (!safeEqual(t, env.VIEW_TOKEN)) return json({ error: "unauthorized" }, 401);
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  if (!Array.isArray(body) || body.length === 0) return json({ error: "invalid_body" }, 400);
+
+  const records = [];
+  for (const [index, r] of body.entries()) {
+    const dev = DEVICES.find((d) => d.event === r?.event);
+    const ms = typeof r?.at === "string" ? Date.parse(r.at) : NaN;
+    if (!dev || Number.isNaN(ms)) return json({ error: "invalid_record", index }, 400);
+    records.push({ event: dev.event, device_id: dev.id, at: new Date(ms).toISOString() });
+  }
+  // エクスポートは新しい順なので、id が時刻順になるよう古い順に入れる
+  records.sort((a, b) => a.at.localeCompare(b.at));
+
+  const insert = env.DB.prepare("INSERT INTO logs (event, device_id, at, request_id) VALUES (?, ?, ?, NULL)");
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM logs"),
+    ...records.map((r) => insert.bind(r.event, r.device_id, r.at)),
+  ]);
+  return json({ imported: records.length });
 }
 
 // ---------- util ----------
