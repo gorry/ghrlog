@@ -4,7 +4,7 @@
 [![Cloudflare Workers](https://img.shields.io/badge/Platform-Cloudflare_Workers_%2B_D1-orange.svg)](https://workers.cloudflare.com/)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.0.0-green.svg)](https://nodejs.org/)
 
-バージョン 2026.1012.1 ・ Copyright (C) 2026 GORRY. ・ Apache License 2.0 ・ https://github.com/gorry/ghrlog
+バージョン 2026.1021.1 ・ Copyright (C) 2026 GORRY. ・ Apache License 2.0 ・ https://github.com/gorry/ghrlog
 
 Google Home（Nest Hub 等）の「おはよう」「おやすみ」ルーティン実行時刻を自動記録・可視化する Cloudflare Worker です。
 
